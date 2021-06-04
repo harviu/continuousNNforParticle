@@ -3,6 +3,7 @@ import os
 import sys
 import math
 import time
+import struct
 
 from vtkmodules import all as vtk
 from vtkmodules.util import numpy_support
@@ -18,9 +19,71 @@ from torch.utils.data import Dataset,DataLoader
 from yt.utilities.sdf import SDFRead
 from thingking import loadtxt
 
+def concat_forward(model,lat_vec,xyz):
+    """
+    Network forward when assuming grid latent vectors
+    Grid latents are concatenated to feed the NN
+    """
+    B,_ = xyz.shape
+    lat_dim, res, _, _ = lat_vec.shape
+    interval = 1/(res-1)
+    index = (xyz // interval).long()
+    index[index==res-1] -= 1
+    idd = (xyz - index * interval)/interval
+    xd = idd[:,0]
+    yd = idd[:,1]
+    zd = idd[:,2]
+    xi,yi,zi = index.T
+    rep_lat = lat_vec.view(1,*lat_vec.shape).repeat(B,1,1,1,1)
+    bi = torch.arange(B)
+
+    code = rep_lat[bi,:,xi,yi,zi]
+    disp = torch.stack([xd,yd,zd],dim=1)
+    code = torch.cat([code,disp],dim=1)
+    lat = code
+
+    code = rep_lat[bi,:,xi+1,yi,zi]
+    disp = torch.stack([xd-1,yd,zd],dim=1)
+    code = torch.cat([code,disp],dim=1)
+    lat = torch.cat((lat,code),dim=1)
+
+    code = rep_lat[bi,:,xi+1,yi+1,zi]
+    disp = torch.stack([xd-1,yd-1,zd],dim=1)
+    code = torch.cat([code,disp],dim=1)
+    lat = torch.cat((lat,code),dim=1)
+
+    code = rep_lat[bi,:,xi+1,yi,zi+1]
+    disp = torch.stack([xd-1,yd,zd-1],dim=1)
+    code = torch.cat([code,disp],dim=1)
+    lat = torch.cat((lat,code),dim=1)
+
+    code = rep_lat[bi,:,xi+1,yi+1,zi+1]
+    disp = torch.stack([xd-1,yd-1,zd-1],dim=1)
+    code = torch.cat([code,disp],dim=1)
+    lat = torch.cat((lat,code),dim=1)
+
+    code = rep_lat[bi,:,xi,yi+1,zi]
+    disp = torch.stack([xd,yd-1,zd],dim=1)
+    code = torch.cat([code,disp],dim=1)
+    lat = torch.cat((lat,code),dim=1)
+
+    code = rep_lat[bi,:,xi,yi+1,zi+1]
+    disp = torch.stack([xd,yd-1,zd-1],dim=1)
+    code = torch.cat([code,disp],dim=1)
+    lat = torch.cat((lat,code),dim=1)
+
+    code = rep_lat[bi,:,xi,yi,zi+1]
+    disp = torch.stack([xd,yd,zd-1],dim=1)
+    code = torch.cat([code,disp],dim=1)
+    lat = torch.cat((lat,code),dim=1)
+    output = model(lat)
+
+    return output
+
 def grid_forward(model,lat_vec,xyz):
     """
     Network forward when assuming grid latent vectors
+    Interpolations are done after grid NN
     """
     B,_ = xyz.shape
     lat_dim, res, _, _ = lat_vec.shape
@@ -91,21 +154,86 @@ def trilinear_interpolation(c000,c100,c110,c101,c111,c010,c011,c001,xd,yd,zd):
     c =  c0 * (1-zd) + c1 * zd
     return c
 
+class PointDataIsabel(Dataset):
+    # dataset in blocks
+    def __init__(self,file_name):
+        super().__init__()
+        data = isabel_reader(file_name)
+        data[data>4000] = 3226
+        # normalize data coord to [0, 1]
+        data_max = 3226
+        data_min = -5471.85791
+        mean = 373.85098
+        std = 586.10516
+        data = (data - mean) /std
+        x = np.linspace(0,1,500)
+        y = np.linspace(0,1,500)
+        z = np.linspace(0,1,100)
+        zz,yy,xx = np.meshgrid(z,y,x,indexing='ij')
+        self.coord = np.stack((xx.flatten(),yy.flatten(),zz.flatten()),axis=1)
+
+        num_bins = 100
+        hist, bin_edges = np.histogram(data,num_bins,density=True)
+        bin_index = np.digitize(data,bin_edges) -1
+        bin_index[bin_index==num_bins] = num_bins-1
+        self.weights = 1 / hist[bin_index]
+        self.data = data[:,None]
+    
+    def __getitem__(self, index):
+        coord = self.coord[index]
+        data = self.data[index]
+        return np.concatenate((coord,data),axis=0)
+    
+    def __len__(self):
+        return len(self.data)
+
 class PointDataFPM(Dataset):
     # dataset in blocks
     def __init__(self,file_name):
+        super().__init__()
         data = vtk_reader(file_name)
-        # normalize data to [0, 1]
+        # normalize data coord to [0, 1]
         data_max = np.array([ 5, 5, 10, 357.19000244, 38.62746811, 48.47133255, 50.60621262])
         data_min = np.array([-5, -5, 0, 0, -5.63886223e+01, -3.69567909e+01, -7.22953186e+01])
-        data = (data - data_min) / (data_max-data_min)
-        data = np.clip(data,0,1)
+        mean = [0, 0, 5, 23.9, 0, 0, 0.034]
+        std = [2.68, 2.68, 3.09, 55.08, 0.3246, 0.3233, 0.6973]
+        data[:,:3] = (data[:,:3] - data_min[:3]) / (data_max[:3]-data_min[:3])
+        data[:,:3] = np.clip(data[:,:3],0,1)
+        data[:,3:] = (data[:,3:] - mean[3:]) /std[3:]
+
         num_bins = 100
         hist, bin_edges = np.histogram(data[:,3],num_bins,density=True)
         bin_index = np.digitize(data[:,3],bin_edges) -1
         bin_index[bin_index==num_bins] = num_bins-1
         self.weights = 1 / hist[bin_index]
         self.data = data
+    
+    def __getitem__(self, index):
+        return self.data[index]
+    
+    def __len__(self):
+        return len(self.data)
+
+class PointDataCOS(Dataset):
+    def __init__(self,filename):
+        super().__init__()
+        data = sdf_reader(filename)
+        data_max=  np.array([0,0,0, -2466, -2761, -2589, -17135.6, -20040, -20096, -6928022])
+        data_min=  np.array([62.5, 62.5, 62.5, 2.7808181e+03, 2.9791230e+03, 2.6991892e+03, 1.9324572e+04, 2.0033873e+04, 1.7973633e+04, 6.3844562e+05])
+        mean = [30.4, 32.8, 32.58, 0, 0, 0, 0, 0, 0, -732720]
+        std = [18.767, 16.76, 17.62, 197.9, 247.2, 193.54, 420.92, 429, 422.3, 888474]
+        data[:,:3] = (data[:,:3] - data_min[:3]) / (data_max[:3]-data_min[:3])
+        data[:,:3] = np.clip(data[:,:3],0,1)
+        data[:,3:] = (data[:,3:] - mean[3:]) /std[3:]
+
+        num_bins = 100
+        hist, bin_edges = np.histogram(data[:,9],num_bins,density=True)
+        bin_index = np.digitize(data[:,9],bin_edges) -1
+        bin_index[bin_index==num_bins] = num_bins-1
+        self.weights = 1 / hist[bin_index]
+        coord = data[:,:3]
+        value = data[:,9][:,None]
+        self.data = np.concatenate((coord,value),axis=-1)
     
     def __getitem__(self, index):
         return self.data[index]
@@ -187,6 +315,11 @@ def sdf_reader(filename):
     numpy_data = np.array(list(particles.values())[2:-1]).T
     numpy_data[:,:3] = convert_to_cMpc(numpy_data[:,:3])
     return numpy_data
+
+def isabel_reader(filename):
+    data = np.fromfile(filename,dtype='f')
+    data = data.byteswap()
+    return data
 
 def all_leaf_nodes(node):
     if node.greater==None and node.lesser==None:
@@ -272,18 +405,10 @@ def vtk_write_image(x_dim,y_dim,z_dim,data,filename):
     assert len(data) == x_dim * y_dim * z_dim
     imageData = vtk.vtkImageData()
     imageData.SetDimensions(x_dim,y_dim,z_dim)
-    imageData.AllocateScalars(vtk.VTK_DOUBLE, 1)
-
-    dims = imageData.GetDimensions()
-
-    # Fill every entry of the image data with "2.0"
-    i = 0
-    for z in range(dims[2]):
-        for y in range(dims[1]):
-            for x in range(dims[0]):
-                imageData.SetScalarComponentFromDouble(z, y, x, 0, data[i])
-                i+=1
-
+    imageData.SetSpacing(1,1,1)
+    imageData.SetOrigin(0,0,0)
+    array = numpy_support.numpy_to_vtk(data,deep=0,array_type=vtk.VTK_FLOAT)
+    imageData.GetPointData().SetScalars(array)
 
     writer = vtk.vtkXMLImageDataWriter()
     writer.SetFileName(filename)

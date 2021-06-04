@@ -5,27 +5,26 @@ import torch.nn.init as init
 
 
 class AD_SDF(nn.Module):
-    def __init__(self, z_dim=256):
+    def __init__(self, z_dim=16, m_dim=256):
         super(AD_SDF, self).__init__()
         self.decoder_stage1 = nn.Sequential(
-            nn.Linear(z_dim+3, z_dim * 2),
+            nn.Linear(z_dim+3, m_dim),
             nn.ReLU(True),
-            # nn.Linear(z_dim * 2, z_dim * 2),
+            # nn.Linear(m_dim, m_dim),
             # nn.ReLU(True),
-            # nn.Linear(z_dim * 2, z_dim * 2),
+            # nn.Linear(m_dim, m_dim),
             # nn.ReLU(True),
-            nn.Linear(z_dim * 2, z_dim-3),
+            nn.Linear(m_dim, m_dim-3-z_dim),
             nn.ReLU(True),)
         
         self.decoder_stage2 = nn.Sequential(
-            nn.Linear(z_dim * 2, z_dim * 2),
+            nn.Linear(m_dim, m_dim),
             nn.ReLU(True),
-            # nn.Linear(z_dim * 2, z_dim * 2),
+            # nn.Linear(m_dim, m_dim),
             # nn.ReLU(True),
-            # nn.Linear(z_dim * 2, z_dim * 2),
+            # nn.Linear(m_dim, m_dim),
             # nn.ReLU(True),
-            nn.Linear(z_dim * 2, 1),
-            nn.Sigmoid())
+            nn.Linear(m_dim, 1))
     
     
     def forward(self, code):
